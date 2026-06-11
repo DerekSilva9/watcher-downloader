@@ -1,140 +1,207 @@
 document.addEventListener('DOMContentLoaded', () => {
-  const videoList = document.getElementById('videoList');
-  const btnReload = document.getElementById('forceReload');
-
-  chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-    const tabId = tabs[0].id;
-
-    // Função marota que roda dentro da página do vídeo pra pegar os dados
-    let pageMeta = { title: 'video_baixado', thumb: '' };
-    try {
-      const [results] = await chrome.scripting.executeScript({
-        target: { tabId: tabId },
-        func: () => {
-          const ogTitle = document.querySelector('meta[property="og:title"]')?.content;
-          const pageTitle = document.title;
-          const videoPoster = document.querySelector('video')?.poster;
-          const ogImg = document.querySelector('meta[property="og:image"]')?.content;
-          
-          return {
-            title: ogTitle || pageTitle || 'video_baixado',
-            thumb: videoPoster || ogImg || ''
-          };
-        }
-      });
-      if (results?.result) pageMeta = results.result;
-    } catch (e) {
-      console.log("Não deu pra ler os metadados da página:", e);
+    const videoList = document.getElementById('videoList');
+    const btnReload = document.getElementById('forceReload');
+    const btnClear = document.getElementById('clearVideos');
+    const totalCount = document.getElementById('totalCount');
+    
+    let currentTabId = null;
+    let pendingQualityChoice = null; // Guarda info enquanto escolhe qualidade
+    
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        currentTabId = tabs[0].id;
+        
+        let pageTitle = 'video';
+        try {
+            const [results] = await chrome.scripting.executeScript({
+                target: { tabId: currentTabId },
+                func: () => document.querySelector('meta[property="og:title"]')?.content || document.title || 'video'
+            });
+            if (results?.result) pageTitle = results.result;
+        } catch (e) {}
+        
+        loadVideos(currentTabId, pageTitle);
+    });
+    
+    async function loadVideos(tabId, pageTitle) {
+        chrome.runtime.sendMessage({ action: 'getVideos', tabId: tabId }, (response) => {
+            const videos = response?.videos || [];
+            
+            if (totalCount) totalCount.textContent = videos.length;
+            
+            if (videos.length === 0) {
+                videoList.innerHTML = `<div class="empty-state"><span>🎬</span><p>Nenhum vídeo detectado</p><small>Dê play no vídeo</small></div>`;
+                return;
+            }
+            
+            videoList.innerHTML = '';
+            const cleanTitle = pageTitle.replace(/[\\/:*?"<>|]/g, '_').substring(0, 50);
+            
+            videos.forEach((video, index) => {
+                const isHLS = video.isHLS;
+                const isDirect = video.type === 'direct';
+                
+                const div = document.createElement('div');
+                div.className = 'video-item';
+                
+                // Mostra qualidade se disponível
+                const qualityInfo = video.quality && video.quality !== 'Unknown' ? ` (${video.quality})` : '';
+                
+                div.innerHTML = `
+                    <div class="video-info">
+                        <span class="video-type ${isHLS ? 'hls' : 'direct'}">${isHLS ? '📡 HLS' : '📹 Direct'}</span>
+                        <span class="video-filename">${cleanTitle}${qualityInfo}.mp4</span>
+                    </div>
+                    <div class="video-url">${truncateUrl(video.cleanUrl, 60)}</div>
+                    <button class="download-btn" data-url="${escapeHtml(video.url)}" data-type="${isHLS ? 'hls' : 'direct'}" data-filename="${escapeHtml(cleanTitle)}">
+                        ${isHLS ? '🎬 Escolher Qualidade' : '⬇️ Baixar Direct'}
+                    </button>
+                `;
+                
+                const btn = div.querySelector('.download-btn');
+                btn.addEventListener('click', async () => {
+                    const url = btn.dataset.url;
+                    const type = btn.dataset.type;
+                    const filename = btn.dataset.filename;
+                    
+                    if (type === 'hls') {
+                        // Busca qualidades disponíveis
+                        btn.textContent = '⏳ Buscando qualidades...';
+                        btn.disabled = true;
+                        
+                        chrome.runtime.sendMessage({ action: 'getQualities', url: url }, (response) => {
+                            const qualities = response?.qualities || [];
+                            
+                            if (qualities.length === 0) {
+                                // Se não achou qualidades, baixa direto
+                                startDownload(url, filename, true);
+                                return;
+                            }
+                            
+                            // Mostra modal com opções de qualidade
+                            showQualityModal(qualities, url, filename);
+                            btn.disabled = false;
+                            btn.textContent = '🎬 Escolher Qualidade';
+                        });
+                    } else {
+                        // Direct: baixa direto
+                        startDownload(url, filename, false);
+                    }
+                });
+                
+                videoList.appendChild(div);
+            });
+        });
     }
-
-    // Limpa caracteres estranhos do título pra não dar erro no Windows/Linux ao salvar
-    const cleanTitle = pageMeta.title.replace(/[\\/:*?"<>|]/g, '_').trim();
-
-    chrome.storage.local.get(['videos'], (res) => {
-      const videos = res.videos || {};
-      const tabVideos = videos[tabId] || [];
-      const filteredVideos = tabVideos.filter(url => !url.toLowerCase().includes('_tlp_'));
-
-      if (filteredVideos.length === 0) {
-        videoList.innerHTML = "Nenhum vídeo real detectado ainda.";
-        return;
-      }
-
-      videoList.innerHTML = '';
-      filteredVideos.forEach((url, index) => {
-        const div = document.createElement('div');
-        div.className = 'video-item';
-        div.style = "margin-top: 10px; padding: 10px; background: #eee; word-break: break-all; display: flex; flex-direction: column; gap: 5px;";
+    
+    function startDownload(url, filename, isHLS) {
+        chrome.runtime.sendMessage({
+            action: 'start_download',
+            url: url,
+            title: filename,
+            isHLS: isHLS
+        });
+        setTimeout(() => window.close(), 500);
+    }
+    
+    function showQualityModal(qualities, originalUrl, filename) {
+        // Remove modal antigo se existir
+        const oldModal = document.getElementById('qualityModal');
+        if (oldModal) oldModal.remove();
         
-        const isHLS = url.includes('.m3u8');
-        
-        // Se achou thumbnail, bota ela na tela
-        const thumbHtml = pageMeta.thumb ? `<img src="${pageMeta.thumb}" style="width: 100%; max-height: 120px; object-fit: cover; border-radius: 4px;">` : '';
-
-        div.innerHTML = `
-          ${thumbHtml}
-          <strong>${cleanTitle} ${isHLS ? '(Stream)' : ''}</strong>
-          <small style="color: #666;">${url.split('?')[0].substring(0, 40)}...</small>
+        const modal = document.createElement('div');
+        modal.id = 'qualityModal';
+        modal.style.cssText = `
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.9);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: sans-serif;
         `;
         
-        const btn = document.createElement('button');
-        btn.className = 'download-btn';
-        btn.style = "background: #4CAF50; color: white; border: none; padding: 8px; cursor: pointer; margin-top: 5px;";
-        btn.innerText = 'Baixar Vídeo';
+        modal.innerHTML = `
+            <div style="background: #1a1a2e; border-radius: 12px; padding: 20px; width: 280px;">
+                <h4 style="margin: 0 0 16px 0; color: #eee;">Escolha a qualidade</h4>
+                <div id="qualityOptions" style="display: flex; flex-direction: column; gap: 8px;">
+                    ${qualities.map(q => `
+                        <button class="quality-option" data-url="${escapeHtml(q.url)}" data-name="${q.name}" style="
+                            background: #16213e;
+                            border: none;
+                            padding: 10px;
+                            border-radius: 8px;
+                            color: #eee;
+                            cursor: pointer;
+                            font-size: 14px;
+                            text-align: left;
+                        ">
+                            📺 ${q.name} ${q.resolution ? `(${q.resolution})` : ''}
+                        </button>
+                    `).join('')}
+                </div>
+                <button id="closeModal" style="
+                    width: 100%;
+                    margin-top: 12px;
+                    background: #e94560;
+                    border: none;
+                    padding: 8px;
+                    border-radius: 8px;
+                    color: white;
+                    cursor: pointer;
+                ">Cancelar</button>
+            </div>
+        `;
         
-        btn.onclick = async () => {
-          if (isHLS) {
-            btn.innerText = 'Baixando pedaços...';
-            btn.disabled = true;
-            try {
-              await downloadHLS(url, btn, cleanTitle);
-              btn.innerText = 'Concluído!';
-            } catch (err) {
-              btn.innerText = 'Erro ao baixar';
-              console.error(err);
-            }
-          } else {
-            chrome.downloads.download({ url: url, filename: `${cleanTitle}.mp4` });
-          }
-        };
-
-        div.appendChild(btn);
-        videoList.appendChild(div);
-      });
-    });
-
-    btnReload.onclick = () => {
-      chrome.storage.local.get(['videos'], (res) => {
-        const videos = res.videos || {};
-        videos[tabId] = [];
-        chrome.storage.local.set({ videos }, () => {
-          chrome.tabs.reload(tabId);
-          window.close();
+        document.body.appendChild(modal);
+        
+        // Adiciona eventos aos botões de qualidade
+        modal.querySelectorAll('.quality-option').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const qualityUrl = btn.dataset.url;
+                const qualityName = btn.dataset.name;
+                modal.remove();
+                startDownload(qualityUrl, `${filename}_${qualityName}`, true);
+            });
         });
-      });
-    };
-  });
+        
+        document.getElementById('closeModal').addEventListener('click', () => modal.remove());
+    }
+    
+    btnReload.addEventListener('click', () => {
+        btnReload.textContent = '🔄 Recarregando...';
+        btnReload.disabled = true;
+        chrome.runtime.sendMessage({ action: 'clearTabVideos', tabId: currentTabId }, () => {
+            chrome.tabs.reload(currentTabId, { bypassCache: true });
+            setTimeout(() => window.close(), 300);
+        });
+    });
+    
+    if (btnClear) {
+        btnClear.addEventListener('click', () => {
+            chrome.runtime.sendMessage({ action: 'clearTabVideos', tabId: currentTabId }, () => {
+                loadVideos(currentTabId, '');
+                btnClear.textContent = '✓ Limpo!';
+                setTimeout(() => { btnClear.textContent = '🗑️ Limpar Lista'; }, 1000);
+            });
+        });
+    }
+    
+    function truncateUrl(url, maxLength) {
+        if (!url) return '';
+        return url.length <= maxLength ? url : url.substring(0, maxLength) + '...';
+    }
+    
+    function escapeHtml(str) {
+        if (!str) return '';
+        return str.replace(/[&<>]/g, function(m) {
+            if (m === '&') return '&amp;';
+            if (m === '<') return '&lt;';
+            if (m === '>') return '&gt;';
+            return m;
+        });
+    }
 });
-
-// Atualizado pra receber o nome inteligente do arquivo
-async function downloadHLS(m3u8Url, buttonElement, fileName) {
-  const response = await fetch(m3u8Url);
-  const text = await response.text();
-  
-  const lines = text.split('\n');
-  const baseUrl = m3u8Url.substring(0, m3u8Url.lastIndexOf('/') + 1);
-  const segments = [];
-  
-  lines.forEach(line => {
-    line = line.trim();
-    if (line && !line.startsWith('#')) {
-      if (!line.startsWith('http')) {
-        segments.push(baseUrl + line);
-      } else {
-        segments.push(line);
-      }
-    }
-  });
-
-  if (segments.length === 0) throw new Error('Sem segmentos no m3u8');
-
-  const chunks = [];
-  for (let i = 0; i < segments.length; i++) {
-    buttonElement.innerText = `Baixando: ${i + 1}/${segments.length}`;
-    try {
-      const segRes = await fetch(segments[i]);
-      const buffer = await segRes.arrayBuffer();
-      chunks.push(buffer);
-    } catch (e) {
-      console.error(`Erro no pedaço ${i}:`, e);
-    }
-  }
-
-  const finalBlob = new Blob(chunks, { type: 'video/mp4' });
-  const blobUrl = URL.createObjectURL(finalBlob);
-  
-  chrome.downloads.download({
-    url: blobUrl,
-    filename: `${fileName}.mp4` // Smartnaming aqui!
-  });
-}

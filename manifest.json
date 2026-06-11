@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Caçador de Vídeos",
-  "version": "1.1",
+  "version": "1.3",
   "permissions": [
     "webRequest",
     "activeTab",
     "downloads",
     "storage",
-    "scripting"
+    "scripting",
+    "offscreen"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -17,5 +18,9 @@
   },
   "action": {
     "default_popup": "popup.html"
-  }
+  },
+  "web_accessible_resources": [{
+    "resources": ["libs/mp4box.all.min.js"],
+    "matches": ["<all_urls>"]
+  }]
 }
